@@ -1,0 +1,1211 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AAC 專業溝通板系統</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken, signOut, signInWithEmailAndPassword, createUserWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getDatabase, ref, set, get, update, remove, onValue, off, push } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-database.js";
+
+        // 您的專用 Firebase 連結配置 (Realtime Database 已整合)
+        const firebaseConfig = {
+            apiKey: "AIzaSyB1d_9Phv2EhvishA7pm2QoLihm8sw6x2Y",
+            authDomain: "testcard-7c32d.firebaseapp.com",
+            databaseURL: "https://testcard-7c32d-default-rtdb.firebaseio.com",
+            projectId: "testcard-7c32d",
+            storageBucket: "testcard-7c32d.firebasestorage.app",
+            messagingSenderId: "457469361983",
+            appId: "1:457469361983:web:d61b6b5d8ece4d235add8a",
+            measurementId: "G-3K3KXMFXT4"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getDatabase(app);
+        
+        // 核心修正：過濾 Realtime Database 路徑不合法的字元
+        const rawAppId = typeof __app_id !== 'undefined' ? __app_id : "aac-pro-v5";
+        const appId = rawAppId.replace(/[\.#\$\[\]]/g, "_");
+
+        let currentUser = null;
+        let allCategories = [];
+        let selectedCategoryIds = [];
+        let extraIndividualCards = []; // 儲存單獨新增、不屬於目前勾選類別的字卡清單
+        let currentEditingCategory = null;
+        let selectedSentence = [];
+        let longPressTimer = null;
+        let isLongPressActive = false;
+        
+        // 追蹤 Realtime Database 監聽物件以供解除訂閱
+        let editRefTrack = null;
+        let editCallbackTrack = null;
+        let categoriesRefTrack = null;
+        let categoriesCallbackTrack = null;
+        
+        let pendingDeletePath = null;
+        let lastAISuggestion = "";
+        let currentSessionId = null; // 本次登入的序號 (字串 '1', '2', '3'...)
+        const synth = window.speechSynthesis;
+
+        // --- 核心導覽 ---
+        window.switchView = (viewId) => {
+            document.querySelectorAll('.view-screen').forEach(v => v.classList.add('hidden'));
+            const target = document.getElementById(viewId);
+            if (target) target.classList.remove('hidden');
+            
+            if(viewId === 'categoryView') renderCategories();
+            if(viewId === 'boardView') renderMainBoard();
+            if(viewId === 'reportView') renderReportBoard();
+        };
+
+        // --- Toast 提示系統 ---
+        window.showToast = (msg, duration = 3000) => {
+            const toast = document.getElementById('toastNotification');
+            const toastText = document.getElementById('toastText');
+            if (toast && toastText) {
+                toastText.innerText = msg;
+                toast.classList.remove('hidden');
+                toast.classList.add('flex', 'animate-pop');
+                setTimeout(() => {
+                    toast.classList.add('hidden');
+                    toast.classList.remove('flex', 'animate-pop');
+                }, duration);
+            }
+        };
+
+        window.speak = (text) => {
+            if (synth.speaking) synth.cancel();
+            const u = new SpeechSynthesisUtterance(text);
+            u.lang = 'zh-TW';
+            u.rate = 1.0;
+            synth.speak(u);
+        };
+
+        // 朗讀完整語句
+        window.speakSentence = () => {
+            const fullText = selectedSentence.map(i => i.text).join('');
+            if (fullText) window.speak(fullText);
+        };
+
+        // 朗讀 AI 修改建議語句
+        window.speakAISuggestion = () => {
+            if (lastAISuggestion) {
+                window.speak(lastAISuggestion);
+            } else {
+                window.showToast("👉 請先按下機器人進行分析喔！");
+            }
+        };
+
+        const fileToBase64 = (file) => new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = error => reject(error);
+        });
+
+        // --- 初始化預設數據 (增加 Race Condition 預防保護) ---
+        const initDefaultData = async (uid) => {
+            // 先關閉監聽器避免寫入預設值時重複觸發 re-render
+            if (categoriesRefTrack && categoriesCallbackTrack) {
+                off(categoriesRefTrack, 'value', categoriesCallbackTrack);
+            }
+
+            const defaults = [
+                { name: "情緒", icon: "😊", color: "#dcfce7", cards: [{text:"開心", icon:"😊"}, {text:"生氣", icon:"😡"}, {text:"難過", icon:"😢"}] },
+                { name: "家人", icon: "👨‍👩‍👧", color: "#dbeafe", cards: [{text:"爸爸", icon:"👨"}, {text:"媽媽", icon:"👩"}, {text:"奶奶", icon:"👵"}] },
+                { name: "動作", icon: "🏃", color: "#ffedd5", cards: [{text:"吃", icon:"😋"}, {text:"喝", icon:"🥛"}, {text:"跑", icon:"🏃"}] },
+                { name: "食物", icon: "🍱", color: "#fef9c3", cards: [{text:"飯", icon:"🍚"}, {text:"麵", icon:"🍜"}, {text:"餅乾", icon:"🍪"}] },
+                { name: "告狀", icon: "📢", color: "#fee2e2", cards: [] },
+                { name: "其他", icon: "📦", color: "#f3f4f6", cards: [] }
+            ];
+            
+            for (let d of defaults) {
+                const catListRef = ref(db, `artifacts/${appId}/users/${uid}/categories`);
+                const newCatRef = push(catListRef);
+                const catId = newCatRef.key;
+                
+                await set(newCatRef, { name: d.name, icon: d.icon, color: d.color, id: catId });
+                
+                for (let c of d.cards) {
+                    const cardListRef = ref(db, `artifacts/${appId}/users/${uid}/categories/${catId}/cards`);
+                    const newCardRef = push(cardListRef);
+                    const cardId = newCardRef.key;
+                    await set(newCardRef, { ...c, id: cardId });
+                }
+            }
+
+            // 完成初始化寫入後，重新連結動態即時監聽器
+            connectDatabaseListener(uid);
+        };
+
+        // --- 核心結構：Session Setup ---
+        const setupSession = async (uid) => {
+            if (uid === "local_user") return;
+            try {
+                const sessionsRef = ref(db, `artifacts/${appId}/users/${uid}/sessions`);
+                const snapshot = await get(sessionsRef);
+                let nextNum = 1;
+                if (snapshot.exists()) {
+                    const data = snapshot.val();
+                    const keys = Object.keys(data).map(Number).filter(n => !isNaN(n));
+                    if (keys.length > 0) {
+                        nextNum = Math.max(...keys) + 1;
+                    }
+                }
+                currentSessionId = String(nextNum);
+
+                const sessionDocRef = ref(db, `artifacts/${appId}/users/${uid}/sessions/${currentSessionId}`);
+                await set(sessionDocRef, {
+                    sessionNum: nextNum,
+                    loginTime: new Date().toISOString(),
+                    selectedCategories: [],
+                    added: {
+                        categories: {},
+                        cards: {}
+                    },
+                    ai_analyses: {}
+                });
+            } catch (err) {
+                console.warn("無法建立使用紀錄序號:", err);
+            }
+        };
+
+        // --- 介面渲染 ---
+        const renderCategories = () => {
+            const container = document.getElementById('categoryGrid');
+            if (!container) return;
+            container.innerHTML = '';
+            
+            allCategories.forEach(cat => {
+                const isSelected = selectedCategoryIds.includes(cat.id);
+                const div = document.createElement('div');
+                div.className = `cat-card relative animate-pop flex-shrink-0 scroll-snap-center ${isSelected ? 'ring-8 ring-blue-400 scale-105' : ''}`;
+                div.style.backgroundColor = cat.color || '#ffffff';
+                
+                let iconHtml = cat.image ? `<img src="${cat.image}" class="h-1/2 w-4/5 object-contain pointer-events-none mx-auto">` : `<div class="text-6xl lg:text-8xl pointer-events-none text-center">${cat.icon || '📁'}</div>`;
+                div.innerHTML = `<div class="text-2xl lg:text-3xl font-black mb-4 pointer-events-none text-center px-2">${cat.name}</div>${iconHtml}`;
+                
+                div.oncontextmenu = (e) => e.preventDefault();
+                div.onpointerdown = (e) => {
+                    isLongPressActive = false;
+                    longPressTimer = setTimeout(() => {
+                        isLongPressActive = true;
+                        openEditCategory(cat);
+                    }, 700);
+                };
+                div.onpointerup = () => {
+                    clearTimeout(longPressTimer);
+                    if(!isLongPressActive) toggleCategory(cat.id);
+                };
+                div.onpointerleave = () => clearTimeout(longPressTimer);
+                container.appendChild(div);
+            });
+
+            const addCard = document.createElement('div');
+            addCard.className = "cat-card-add flex-shrink-0 scroll-snap-center";
+            addCard.innerHTML = `<div class="w-16 h-16 bg-yellow-400 rounded-full flex items-center justify-center text-4xl text-white mb-4 shadow-lg">＋</div><div class="text-xl lg:text-2xl font-black">新增類別</div>`;
+            addCard.onclick = () => document.getElementById('addCategoryModal').style.display = 'flex';
+            container.appendChild(addCard);
+        };
+
+        window.scrollCategories = (direction) => {
+            const container = document.getElementById('categoryGrid');
+            const cardWidth = 320; 
+            if (direction === 'left') container.scrollBy({ left: -cardWidth, behavior: 'smooth' });
+            else container.scrollBy({ left: cardWidth, behavior: 'smooth' });
+        };
+
+        const toggleCategory = async (id) => {
+            const idx = selectedCategoryIds.indexOf(id);
+            if(idx > -1) {
+                selectedCategoryIds.splice(idx, 1);
+            } else {
+                if (selectedCategoryIds.length >= 3) {
+                    window.showToast("⚠️ 老師說最多只能挑選 3 個類別喔！");
+                    window.speak("最多只能挑選三個類別");
+                    return;
+                }
+                selectedCategoryIds.push(id);
+            }
+            renderSelectedBar();
+            renderCategories();
+
+            if (currentUser && currentUser.uid !== "local_user" && currentSessionId) {
+                try {
+                    const selectedCategoriesRef = ref(db, `artifacts/${appId}/users/${currentUser.uid}/sessions/${currentSessionId}/selectedCategories`);
+                    const selectedNames = selectedCategoryIds.map(sid => {
+                        const matched = allCategories.find(c => c.id === sid);
+                        return matched ? matched.name : sid;
+                    });
+                    await set(selectedCategoriesRef, selectedNames);
+                } catch(err) {
+                    console.warn("寫入 Session 選擇類別失敗:", err);
+                }
+            }
+        };
+
+        const renderSelectedBar = () => {
+            const bar = document.getElementById('selectedBar');
+            if (!bar) return;
+            bar.innerHTML = '';
+            selectedCategoryIds.forEach(id => {
+                const cat = allCategories.find(c => c.id === id);
+                if(!cat) return;
+                const div = document.createElement('div');
+                div.className = "h-14 lg:h-16 px-4 lg:px-6 bg-white border-4 border-black rounded-[2rem] flex items-center gap-2 cursor-pointer flex-shrink-0 animate-pop shadow-md";
+                let iconHtml = cat.image ? `<img src="${cat.image}" class="w-8 h-8 lg:w-10 lg:h-10 object-contain">` : `<span class="text-2xl lg:text-3xl">${cat.icon}</span>`;
+                div.innerHTML = `${iconHtml}<span class="font-black text-lg lg:text-xl ml-1">${cat.name}</span>`;
+                div.onclick = () => toggleCategory(id);
+                bar.appendChild(div);
+            });
+        };
+
+        // --- 類別卡片編輯頁面 (支援極速響應重繪) ---
+        const openEditCategory = async (cat) => {
+            if (!currentUser) return;
+            currentEditingCategory = cat;
+            window.switchView('editCategoryView');
+            
+            const headerLabel = document.getElementById('editHeaderLabel');
+            const headerIcon = document.getElementById('editHeaderIcon');
+            const editView = document.getElementById('editCategoryView');
+
+            if (headerLabel) headerLabel.innerText = cat.name;
+            if (headerIcon) headerIcon.innerHTML = cat.image ? `<img src="${cat.image}" class="h-20 lg:h-24 w-20 lg:w-24 object-contain mx-auto">` : `<div class="text-6xl lg:text-8xl text-center">${cat.icon}</div>`;
+            if (editView) editView.style.backgroundColor = (cat.color || '#ffffff') + '33'; 
+
+            // 如果是單機模式，直接走本機記憶體渲染
+            if (currentUser.uid === "local_user") {
+                renderEditCardsFromMemory(cat);
+                return;
+            }
+
+            if(editRefTrack && editCallbackTrack) {
+                off(editRefTrack, 'value', editCallbackTrack);
+            }
+
+            editRefTrack = ref(db, `artifacts/${appId}/users/${currentUser.uid}/categories/${cat.id}/cards`);
+            editCallbackTrack = onValue(editRefTrack, (snapshot) => {
+                const grid = document.getElementById('editCardsGrid');
+                if (!grid) return;
+                grid.innerHTML = '';
+                
+                const data = snapshot.val() || {};
+                Object.keys(data).forEach(cardId => {
+                    const card = data[cardId];
+                    const div = document.createElement('div');
+                    div.className = "board-card h-40 w-36 lg:h-52 lg:w-44 animate-pop relative flex-shrink-0";
+                    div.style.backgroundColor = cat.color || '#fff';
+                    let iconHtml = card.image ? `<img src="${card.image}" class="h-3/5 w-4/5 object-contain mx-auto">` : `<div class="text-5xl lg:text-6xl text-center">${card.icon}</div>`;
+                    div.innerHTML = `<div class="text-lg lg:text-xl font-black mb-2 text-center truncate px-2">${card.text}</div>${iconHtml}`;
+                    
+                    div.oncontextmenu = (e) => e.preventDefault();
+                    div.onpointerdown = () => {
+                        isLongPressActive = false;
+                        longPressTimer = setTimeout(() => {
+                            isLongPressActive = true;
+                            window.askDelete(`artifacts/${appId}/users/${currentUser.uid}/categories/${cat.id}/cards/${cardId}`, card.text);
+                        }, 800);
+                    };
+                    div.onpointerup = () => clearTimeout(longPressTimer);
+                    div.onpointerleave = () => clearTimeout(longPressTimer);
+                    grid.appendChild(div);
+                });
+
+                const addBtn = document.createElement('div');
+                addBtn.className = "cat-card-add h-40 w-36 lg:h-52 lg:w-44 flex-shrink-0";
+                addBtn.innerHTML = `<div class="w-10 h-10 lg:w-16 lg:h-16 bg-yellow-400 rounded-full flex items-center justify-center text-3xl lg:text-5xl text-white mb-2 shadow-md">＋</div><div class="text-base lg:text-xl font-black text-center">新增字卡</div>`;
+                addBtn.onclick = () => {
+                    updateCategoryDropdown();
+                    document.getElementById('targetCategory').value = cat.id;
+                    document.getElementById('addCardModal').style.display = 'flex';
+                };
+                grid.appendChild(addBtn);
+            }, (error) => {
+                console.warn("偵聽編輯字卡失敗:", error);
+            });
+        };
+
+        // 單機本地模式記憶體字卡渲染
+        const renderEditCardsFromMemory = (cat) => {
+            const grid = document.getElementById('editCardsGrid');
+            if (!grid) return;
+            grid.innerHTML = '';
+            
+            const data = cat.cards || {};
+            Object.keys(data).forEach(cardId => {
+                const card = data[cardId];
+                const div = document.createElement('div');
+                div.className = "board-card h-40 w-36 lg:h-52 lg:w-44 animate-pop relative flex-shrink-0";
+                div.style.backgroundColor = cat.color || '#fff';
+                let iconHtml = card.image ? `<img src="${card.image}" class="h-3/5 w-4/5 object-contain mx-auto">` : `<div class="text-5xl lg:text-6xl text-center">${card.icon}</div>`;
+                div.innerHTML = `<div class="text-lg lg:text-xl font-black mb-2 text-center truncate px-2">${card.text}</div>${iconHtml}`;
+                
+                div.oncontextmenu = (e) => e.preventDefault();
+                div.onpointerdown = () => {
+                    isLongPressActive = false;
+                    longPressTimer = setTimeout(() => {
+                        isLongPressActive = true;
+                        window.askDelete(`artifacts/${appId}/users/${currentUser.uid}/categories/${cat.id}/cards/${cardId}`, card.text);
+                    }, 800);
+                };
+                div.onpointerup = () => clearTimeout(longPressTimer);
+                div.onpointerleave = () => clearTimeout(longPressTimer);
+                grid.appendChild(div);
+            });
+
+            const addBtn = document.createElement('div');
+            addBtn.className = "cat-card-add h-40 w-36 lg:h-52 lg:w-44 flex-shrink-0";
+            addBtn.innerHTML = `<div class="w-10 h-10 lg:w-16 lg:h-16 bg-yellow-400 rounded-full flex items-center justify-center text-3xl lg:text-5xl text-white mb-2 shadow-md">＋</div><div class="text-base lg:text-xl font-black text-center">新增字卡</div>`;
+            addBtn.onclick = () => {
+                updateCategoryDropdown();
+                document.getElementById('targetCategory').value = cat.id;
+                document.getElementById('addCardModal').style.display = 'flex';
+            };
+            grid.appendChild(addBtn);
+        };
+
+        const updateCategoryDropdown = () => {
+            const select = document.getElementById('targetCategory');
+            if (!select) return;
+            select.innerHTML = '';
+            allCategories.forEach(cat => {
+                const opt = document.createElement('option');
+                opt.value = cat.id;
+                opt.innerText = cat.name;
+                select.appendChild(opt);
+            });
+        };
+
+        // --- 主溝通板渲染 (核心重構：載入選取類別的所有字卡 + 單獨新增的跨類別字卡) ---
+        const renderMainBoard = async () => {
+            const grid = document.getElementById('boardGrid');
+            if (!grid) return;
+            grid.innerHTML = '<div class="col-span-10 text-center py-20 font-bold text-gray-400 text-2xl italic">準備中...</div>';
+            
+            let board = new Array(40).fill(null);
+            const sys = [
+                {text:"我", icon:"👧"}, {text:"要", icon:"🙆"}, {text:"不要", icon:"🙅"},
+                {text:"你", icon:"👦"}, {text:"是", icon:"⭕"}, {text:"不是", icon:"❌"},
+                {text:"他", icon:"🧒"}, {text:"會", icon:"💡"}, {text:"不會", icon:"🤯"},
+                {text:"老師", icon:"👩‍🏫"}, {text:"還要", icon:"☝️"}, {text:"等一下", icon:"🖐️"}
+            ];
+            let sP = 0;
+            for(let r=0; r<4; r++) for(let c=0; c<3; c++) board[r*10+c] = sys[sP++];
+
+            board[9] = { text:"添加", icon:"＋", type:"act", action: () => {
+                updateCategoryDropdown();
+                document.getElementById('addCardModal').style.display = 'flex';
+            }};
+            board[19] = { text:"告狀", icon:"☝️👩‍🏫", type:"act", action: () => window.switchView('reportView') };
+            board[29] = { text:"幫忙", icon:"🤝❤️", type:"act", action: () => window.speak("請幫幫我。") };
+            board[39] = { text:"重設", icon:"⚙️", color: "#fce7f3", type:"act", action: () => { window.clearSentence(); window.speak("重設系統"); } };
+
+            let currentCol = 3; 
+            let currentRow = 0;
+            let cardsAllocated = 0;
+            const maxCustomCards = 24;
+
+            // 1. 收集已選取類別中的所有字卡
+            let customCardsToRender = [];
+            for (let catId of selectedCategoryIds) {
+                const catInfo = allCategories.find(c => c.id === catId);
+                if (!catInfo) continue;
+                
+                const cardsData = catInfo.cards || {};
+                Object.keys(cardsData).forEach(cardId => {
+                    customCardsToRender.push({
+                        ...cardsData[cardId],
+                        color: catInfo.color,
+                        isCustom: true,
+                        catId: catId,
+                        path: `artifacts/${appId}/users/${currentUser.uid}/categories/${catId}/cards/${cardId}`
+                    });
+                });
+            }
+
+            // 2. 額外追加單獨新增的跨類別字卡（若其所屬類別已被選取，則過濾避免重複呈現）
+            extraIndividualCards.forEach(card => {
+                if (!selectedCategoryIds.includes(card.catId)) {
+                    const catInfo = allCategories.find(c => c.id === card.catId);
+                    const cardColor = catInfo ? catInfo.color : '#ffffff';
+                    customCardsToRender.push({
+                        ...card,
+                        color: cardColor,
+                        path: card.path || `artifacts/${appId}/users/${currentUser.uid}/categories/${card.catId}/cards/${card.id}`
+                    });
+                }
+            });
+
+            // 3. 依序排入 28 格面板的剩餘區塊
+            for (let card of customCardsToRender) {
+                if (cardsAllocated < maxCustomCards) {
+                    board[currentRow * 10 + currentCol] = card;
+                    currentRow++;
+                    cardsAllocated++;
+                    if (currentRow >= 4) { 
+                        currentRow = 0; 
+                        currentCol++; 
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            drawBoard(grid, board, "main");
+        };
+
+        // --- 告狀板渲染 ---
+        const renderReportBoard = async () => {
+            const grid = document.getElementById('reportBoardGrid');
+            if (!grid) return;
+            grid.innerHTML = '<div class="col-span-10 text-center py-20 font-bold text-gray-400 text-2xl italic">讀取告狀板...</div>';
+            let board = new Array(40).fill(null);
+
+            const people = [{text:"我", icon:"👧", color:"#f9f5eb"}, {text:"你", icon:"👦", color:"#f9f5eb"}, {text:"他", icon:"🧒", color:"#f9f5eb"}, {text:"老師", icon:"👩‍🏫", color:"#f9f5eb"}];
+            people.forEach((p, i) => board[i*10] = p);
+
+            const actions = [{text:"踢", icon:"🦵", color:"#fbcfe8"}, {text:"撞", icon:"💥", color:"#fbcfe8"}, {text:"打", icon:"👊", color:"#fbcfe8"}, {text:"罵", icon:"🤬", color:"#fbcfe8"}, {text:"捏", icon:"🤏", color:"#fbcfe8"}, {text:"抓", icon:"🐾", color:"#fbcfe8"}, {text:"拿", icon:"🤲", color:"#fbcfe8"}, {text:"搶", icon:"👐", color:"#fbcfe8"}];
+            actions.forEach((a, i) => { const col = i < 4 ? 4 : 5; const row = i % 4; board[row * 10 + col] = a; });
+
+            const feelings = [{text:"覺得", icon:"💭", color:"#dcfce7"}, {text:"討厭", icon:"😤", color:"#dcfce7"}, {text:"生氣", icon:"😡", color:"#dcfce7"}, {text:"難過", icon:"😢", color:"#dcfce7"}];
+            feelings.forEach((f, i) => board[i*10 + 7] = f);
+
+            board[9] = { text:"添加", icon:"＋", type:"act", action: () => {
+                updateCategoryDropdown();
+                const reportCat = allCategories.find(c => c.name === "告狀");
+                if(reportCat) document.getElementById('targetCategory').value = reportCat.id;
+                document.getElementById('addCardModal').style.display = 'flex';
+            }};
+
+            const reportCat = allCategories.find(c => c.name === "告狀");
+            if (reportCat) {
+                const cardsData = reportCat.cards || {};
+                const customCards = [];
+                Object.keys(cardsData).forEach(cardId => {
+                    customCards.push({
+                        ...cardsData[cardId],
+                        color: reportCat.color,
+                        isCustom: true,
+                        path: `artifacts/${appId}/users/${currentUser.uid}/categories/${reportCat.id}/cards/${cardId}`
+                    });
+                });
+
+                const availableCols = [1, 2, 3, 6, 8];
+                let cardIdx = 0;
+                for (let col of availableCols) {
+                    for (let row = 0; row < 4; row++) {
+                        if (cardIdx >= customCards.length) break;
+                        board[row * 10 + col] = customCards[cardIdx++];
+                    }
+                    if (cardIdx >= customCards.length) break;
+                }
+            }
+            drawBoard(grid, board, "report");
+        };
+
+        const drawBoard = (container, board, type) => {
+            container.innerHTML = '';
+            board.forEach((item, idx) => {
+                const div = document.createElement('div');
+                div.className = item ? "board-card-main animate-pop" : "board-empty";
+                
+                if(item) {
+                    div.style.backgroundColor = item.color || '#fff';
+                    let iconHtml = item.image ? `<img src="${item.image}" class="h-1/2 w-4/5 object-contain mx-auto">` : `<div class="text-2xl lg:text-4xl text-center">${item.icon || '❓'}</div>`;
+                    div.innerHTML = `<div class="text-sm lg:text-xl font-black truncate w-full text-center mb-1 leading-tight text-gray-800">${item.text}</div>${iconHtml}`;
+                    
+                    const colIdx = idx % 10;
+                    const isInDeleteRange = (type === "main" && colIdx >= 3 && colIdx <= 8) || 
+                                          (type === "report" && colIdx >= 1 && colIdx <= 8);
+
+                    div.oncontextmenu = (e) => e.preventDefault();
+                    div.onpointerdown = (e) => {
+                        isLongPressActive = false;
+                        if(item.isCustom && isInDeleteRange) {
+                            longPressTimer = setTimeout(() => {
+                                isLongPressActive = true;
+                                window.askDelete(item.path, item.text);
+                            }, 800);
+                        }
+                    };
+
+                    div.onpointerup = () => {
+                        clearTimeout(longPressTimer);
+                        if(!isLongPressActive) {
+                            if(item.type === 'act') item.action();
+                            else if(selectedSentence.length < 15) { 
+                                selectedSentence.push(item); 
+                                window.speak(item.text); 
+                                updateAllSentenceBars(); 
+                            }
+                        }
+                    };
+                    div.onpointerleave = () => clearTimeout(longPressTimer);
+                }
+                container.appendChild(div);
+            });
+        };
+
+        window.askDelete = (path, name) => {
+            pendingDeletePath = path;
+            document.getElementById('deleteTargetName').innerText = name;
+            document.getElementById('deleteConfirmModal').style.display = 'flex';
+        };
+
+        window.confirmDelete = async () => {
+            if(pendingDeletePath) {
+                // 如果刪除的是單獨呈現的額外字卡，從本地暫存陣列中同步過濾掉
+                extraIndividualCards = extraIndividualCards.filter(card => {
+                    const cardPath = card.path || `artifacts/${appId}/users/${currentUser.uid}/categories/${card.catId}/cards/${card.id}`;
+                    return cardPath !== pendingDeletePath;
+                });
+
+                // 如果是單機模式，更新本地記憶體樹
+                if (currentUser && currentUser.uid === "local_user") {
+                    const parts = pendingDeletePath.split('/');
+                    const catIndex = parts.indexOf("categories");
+                    const cardIndex = parts.indexOf("cards");
+                    const catId = parts[catIndex + 1];
+                    const cardId = parts[cardIndex + 1];
+
+                    const updated = allCategories.map(cat => {
+                        if (cat.id === catId) {
+                            const cards = { ...cat.cards };
+                            delete cards[cardId];
+                            return { ...cat, cards };
+                        }
+                        return cat;
+                    });
+                    window.updateLocalData(updated);
+                    window.closeModal('deleteConfirmModal');
+                    return;
+                }
+
+                try {
+                    const targetRef = ref(db, pendingDeletePath);
+                    await remove(targetRef);
+                    window.closeModal('deleteConfirmModal');
+                } catch (e) { console.warn("刪除字卡失敗:", e); }
+            }
+        };
+
+        const updateAllSentenceBars = () => {
+            const boxes = document.querySelectorAll('.sentence-bar');
+            boxes.forEach(box => {
+                box.innerHTML = '';
+                selectedSentence.forEach(item => {
+                    const div = document.createElement('div');
+                    div.className = "w-14 h-20 lg:w-20 lg:h-24 bg-white border-4 border-black rounded-[1rem] flex flex-col items-center justify-center flex-shrink-0 animate-pop shadow-md";
+                    let iconHtml = item.image ? `<img src="${item.image}" class="w-8 h-8 lg:w-12 lg:h-12 object-contain">` : `<div class="text-xl lg:text-2xl">${item.icon}</div>`;
+                    div.innerHTML = `${iconHtml}<div class="text-xs lg:text-sm font-bold mt-1 text-center truncate w-full px-1">${item.text}</div>`;
+                    box.appendChild(div);
+                });
+            });
+        };
+
+        window.removeLastCard = () => {
+            selectedSentence.pop();
+            updateAllSentenceBars();
+            document.querySelectorAll('.ai-area').forEach(a => a.classList.add('hidden'));
+        };
+
+        window.clearSentence = () => {
+            selectedSentence = [];
+            updateAllSentenceBars();
+            document.querySelectorAll('.ai-area').forEach(a => a.classList.add('hidden'));
+            lastAISuggestion = "";
+            window.speak("清空");
+        };
+
+        // 新增類別
+        window.saveCategory = async () => {
+            const name = document.getElementById('catName').value;
+            const color = document.getElementById('catColor').value;
+            const emoji = document.getElementById('catEmoji').value;
+            const file = document.getElementById('catFile').files[0];
+            if(!name || !currentUser) return;
+            let imageData = null;
+            if(file) imageData = await fileToBase64(file);
+            
+            // 單機本地模式記憶體同步
+            if (currentUser.uid === "local_user") {
+                const catId = "local_cat_" + Date.now();
+                const newCat = { name, color, icon: emoji, image: imageData, id: catId, cards: {} };
+                const updated = [...allCategories, newCat];
+                window.updateLocalData(updated);
+                window.closeModal('addCategoryModal');
+                return;
+            }
+
+            // 1. 儲存於永久自訂區 (持久保留，每次登入均可見)
+            const catListRef = ref(db, `artifacts/${appId}/users/${currentUser.uid}/categories`);
+            const newCatRef = push(catListRef);
+            const catId = newCatRef.key;
+            const catPayload = { name, color, icon: emoji, image: imageData, id: catId };
+            await set(newCatRef, catPayload);
+
+            // 2. 儲存於當前 Session 的新增紀錄下
+            if (currentUser.uid !== "local_user" && currentSessionId) {
+                try {
+                    const sessionCategoriesRef = ref(db, `artifacts/${appId}/users/${currentUser.uid}/sessions/${currentSessionId}/added/categories`);
+                    const newSessionCatRef = push(sessionCategoriesRef);
+                    await set(newSessionCatRef, {
+                        name,
+                        icon: emoji,
+                        timestamp: new Date().toISOString()
+                    });
+                } catch(err) {
+                    console.warn("Session 紀錄類別新增失敗:", err);
+                }
+            }
+
+            window.closeModal('addCategoryModal');
+        };
+
+        // 新增字卡 (永久儲存至資料庫類別中，若非勾選類別，則另外以 extraIndividualCards 的方式直接秀在溝通板中)
+        window.saveCard = async () => {
+            const text = document.getElementById('cardName').value;
+            const emoji = document.getElementById('cardEmoji').value;
+            const catId = document.getElementById('targetCategory').value;
+            const file = document.getElementById('cardFile').files[0];
+            if(!text || !currentUser || !catId) return;
+
+            const isCatSelected = selectedCategoryIds.includes(catId);
+            let imageData = null;
+            if(file) imageData = await fileToBase64(file);
+
+            // 如果該卡片所屬類別「未被勾選」，則記錄在 extra 暫存清單中，供面板無縫單獨呈現
+            if (!isCatSelected) {
+                const extraCard = {
+                    text,
+                    icon: emoji,
+                    image: imageData,
+                    isCustom: true,
+                    catId: catId
+                };
+                extraIndividualCards.push(extraCard);
+            }
+
+            // 單機本地模式記憶體同步
+            if (currentUser.uid === "local_user") {
+                const cardId = "local_card_" + Date.now();
+                const cardPayload = { text, icon: emoji, image: imageData, id: cardId };
+                
+                // 為單機模式下的 extra 暫存卡片補上 id 與 path 資訊
+                if (!isCatSelected) {
+                    const lastExtra = extraIndividualCards[extraIndividualCards.length - 1];
+                    if (lastExtra) {
+                        lastExtra.id = cardId;
+                        lastExtra.path = `artifacts/${appId}/users/${currentUser.uid}/categories/${catId}/cards/${cardId}`;
+                    }
+                }
+
+                const updated = allCategories.map(cat => {
+                    if (cat.id === catId) {
+                        const cards = cat.cards ? { ...cat.cards } : {};
+                        cards[cardId] = cardPayload;
+                        return { ...cat, cards };
+                    }
+                    return cat;
+                });
+                window.updateLocalData(updated);
+                window.closeModal('addCardModal');
+                
+                // 若當前在編輯頁，即時重繪字卡
+                if (currentEditingCategory && currentEditingCategory.id === catId) {
+                    const updatedCat = updated.find(c => c.id === catId);
+                    renderEditCardsFromMemory(updatedCat);
+                }
+                return;
+            }
+
+            // 1. 儲存於永久自訂區 (持久保留，下次登入依然可見)
+            const cardListRef = ref(db, `artifacts/${appId}/users/${currentUser.uid}/categories/${catId}/cards`);
+            const newCardRef = push(cardListRef);
+            const cardId = newCardRef.key;
+            const cardPayload = { text, icon: emoji, image: imageData, id: cardId };
+            await set(newCardRef, cardPayload);
+
+            // 為雲端資料庫模式下的 extra 暫存卡片補上即時建立的實體 path
+            if (!isCatSelected) {
+                const lastExtra = extraIndividualCards[extraIndividualCards.length - 1];
+                if (lastExtra) {
+                    lastExtra.id = cardId;
+                    lastExtra.path = `artifacts/${appId}/users/${currentUser.uid}/categories/${catId}/cards/${cardId}`;
+                }
+            }
+
+            // 2. 儲存於當前 Session 的新增紀錄下
+            if (currentUser.uid !== "local_user" && currentSessionId) {
+                try {
+                    const sessionCardsRef = ref(db, `artifacts/${appId}/users/${currentUser.uid}/sessions/${currentSessionId}/added/cards`);
+                    const parentCategory = allCategories.find(c => c.id === catId);
+                    const newSessionCardRef = push(sessionCardsRef);
+                    await set(newSessionCardRef, {
+                        text,
+                        icon: emoji,
+                        parentCategory: parentCategory ? parentCategory.name : catId,
+                        timestamp: new Date().toISOString()
+                    });
+                } catch(err) {
+                    console.warn("Session 紀錄字卡新增失敗:", err);
+                }
+            }
+
+            window.closeModal('addCardModal');
+        };
+
+        window.closeModal = (id) => {
+            const target = document.getElementById(id);
+            if (target) target.style.display = 'none';
+            document.querySelectorAll('input').forEach(i => { if(i.type !== 'color') i.value = ''; });
+        };
+
+        // AI 專家智慧分析 (親切語言治療師語氣 + 結構化 HTML 排版美化)
+        window.analyzeAI = async () => {
+            if(selectedSentence.length === 0) return;
+            const aiAreas = document.querySelectorAll('.ai-area');
+            const aiResults = document.querySelectorAll('.ai-result');
+            aiAreas.forEach(a => a.classList.remove('hidden'));
+            aiResults.forEach(r => r.innerText = "🤖AI分析中...");
+
+            const userText = selectedSentence.map(i => i.text).join('、');
+            const apiKey = ""; 
+            try {
+                const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{ parts: [{ text: `詞彙：${userText}` }] }],
+                        systemInstruction: { parts: [{ text: "你是一位親切、專業的「兒童語言治療師」。請根據使用者點選的詞彙進行判斷，用簡單、溫柔、白話、小學生與家長能輕易聽懂的語言，給出正向且有建設性的回饋。格式要求（必須包含這兩行且不可合併）：\n【分析】: [治療師的白話引導或正向鼓勵]\n【完整句子】: [提供擴展後的簡單完整範例]\n\n分析與引導規則：\n1. 表達正確且意圖完整（例如「他打我」、「我不要吃」、「我沒有生氣」、「我不要蛋糕」）：【分析】一律回覆：『這句話你表達很好！』，【完整句子】重複該完整句子。\n2. 字卡順序錯誤（例如「蛋糕、不要」）：【分析】指出缺少主詞，並說明否定詞「不要」要放在東西前面，例如：『少了「我」喔！要把「不要」放在「蛋糕」前面喔。』【完整句子】提供：『我不要蛋糕。』\n3. 字卡/否定詞使用錯誤（例如點選「我、不是、生氣」或「不是生氣」）：【分析】指出否定詞用錯了，生氣、難過等情緒要用「沒有」而不是「不是」，例如：『少了「我」喔！而且否定詞用錯了，生氣要用「沒有生氣」而不是「不是生氣」喔！』【完整句子】提供：『我沒有生氣。』\n4. 缺少字卡（例如單點「餅乾」或「飯」）：【分析】指出缺少了主詞與動作，溫柔詢問：『少了是誰、還有動作喔！你想對餅乾做什麼呢？』【完整句子】提供：『我要吃餅乾。』\n5. 無法判讀/字數過少（例如單點「我」或「你」）：【分析】指出字卡太少，鼓勵孩子多表達，例如：『「我」後面可以接好多不一樣的想法喔！你想做什麼呢？』【完整句子】提供：『裝杯開水。』" }] }
+                    })
+                });
+                const data = await response.json();
+                const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "分析中...";
+                
+                // --- 結構化分析排版優化 ---
+                let formattedText = text;
+                formattedText = formattedText.replace(/【分析】\s*[:：]\s*(.*)/g, '<div class="mb-1 text-slate-800"><span class="font-black text-blue-600">💡 治療師分析：</span>$1</div>');
+                formattedText = formattedText.replace(/【完整句子】\s*[:：]\s*(.*)/g, '<div class="text-slate-800"><span class="font-black text-emerald-600">🌟 完整句子：</span><span class="underline decoration-2 decoration-emerald-400 font-bold">$1</span></div>');
+                
+                aiResults.forEach(r => r.innerHTML = formattedText);
+
+                const match = text.match(/【完整句子】\s*[:：]\s*(.*)/);
+                if (match && match[1]) {
+                    lastAISuggestion = match[1].trim();
+                } else {
+                    lastAISuggestion = selectedSentence.map(i => i.text).join('');
+                }
+
+                if (currentUser && currentUser.uid !== "local_user" && currentSessionId) {
+                    try {
+                        const aiAnalysesRef = ref(db, `artifacts/${appId}/users/${currentUser.uid}/sessions/${currentSessionId}/ai_analyses`);
+                        const newAnalysisRef = push(aiAnalysesRef);
+                        await set(newAnalysisRef, {
+                            words: userText,
+                            feedBack: text,
+                            matchedSentence: lastAISuggestion,
+                            timestamp: new Date().toISOString()
+                        });
+                    } catch(err) {
+                        console.warn("寫入 AI Session 紀錄失敗:", err);
+                    }
+                }
+            } catch (err) {
+                aiResults.forEach(r => r.innerText = "服務暫時不可用，請稍後再試。");
+            }
+        };
+
+        window.loginTestAccount = async () => {
+            const email = "test@testcard.com";
+            const password = "password123";
+            window.showToast("⏳ 正在嘗試登入測試帳號...");
+            try {
+                await signInWithEmailAndPassword(auth, email, password);
+                window.showToast("✅ 測試帳號登入成功！");
+            } catch (err) {
+                if (err.code === 'auth/user-not-found' || err.code === 'auth/invalid-credential' || err.code === 'auth/user-disabled') {
+                    try {
+                        await createUserWithEmailAndPassword(auth, email, password);
+                        window.showToast("✨ 成功自動建立並登入測試帳號！");
+                    } catch (createErr) {
+                        if (createErr.code === 'auth/operation-not-allowed') {
+                            window.showToast("⚠️ 登入失敗：後台未開啟帳密登入方法！");
+                            document.getElementById('authErrorModal').style.display = 'flex';
+                        } else {
+                            window.showToast(`❌ 建立測試帳號失敗：${createErr.message}`);
+                        }
+                    }
+                } else if (err.code === 'auth/operation-not-allowed') {
+                    window.showToast("⚠️ 登入失敗：後台未開啟帳密登入方法！");
+                    document.getElementById('authErrorModal').style.display = 'flex';
+                } else {
+                    window.showToast(`❌ 登入失敗：${err.message}`);
+                }
+            }
+        };
+
+        window.loginWithPassword = async () => {
+            const email = document.getElementById('loginEmail').value;
+            const pass = document.getElementById('loginPass').value;
+            if(!email || !pass) {
+                window.showToast("⚠️ 請填入完整的信箱與密碼！");
+                return;
+            }
+            window.showToast("⏳ 正在驗證身分中...");
+            try {
+                await signInWithEmailAndPassword(auth, email, pass);
+                window.showToast("🎉 登入成功！");
+            } catch (err) {
+                if (err.code === 'auth/operation-not-allowed') {
+                    window.showToast("⚠️ 失敗：請到 Firebase Console 啟用 Email/Password 登入！");
+                    document.getElementById('authErrorModal').style.display = 'flex';
+                    return;
+                }
+                
+                try {
+                    await createUserWithEmailAndPassword(auth, email, pass);
+                    window.showToast("🚀 自動註冊並登入成功！");
+                } catch(regErr) {
+                    if (regErr.code === 'auth/operation-not-allowed') {
+                        window.showToast("⚠️ 失敗：請到 Firebase Console 啟用 Email/Password 登入！");
+                        document.getElementById('authErrorModal').style.display = 'flex';
+                    } else {
+                        window.showToast(`❌ 登入失敗：${err.message}`);
+                    }
+                }
+            }
+        };
+
+        // 綁定連線監聽器 (雙向資料流響應式核心)
+        const connectDatabaseListener = (uid) => {
+            categoriesRefTrack = ref(db, `artifacts/${appId}/users/${uid}/categories`);
+            categoriesCallbackTrack = onValue(categoriesRefTrack, (snapshot) => {
+                const data = snapshot.val();
+                if (data) {
+                    allCategories = Object.keys(data).map(key => ({
+                        ...data[key],
+                        id: key
+                    }));
+                } else {
+                    allCategories = [];
+                }
+                
+                if (allCategories.length === 0) {
+                    initDefaultData(uid);
+                } else {
+                    // 自動即時重繪目前所在的畫面
+                    if (!document.getElementById('categoryView').classList.contains('hidden')) {
+                        renderCategories();
+                    }
+                    if (!document.getElementById('boardView').classList.contains('hidden')) {
+                        renderMainBoard();
+                    }
+                    if (!document.getElementById('reportView').classList.contains('hidden')) {
+                        renderReportBoard();
+                    }
+                    
+                    // 登入後自動導向挑選類別頁
+                    if (!document.getElementById('loginView').classList.contains('hidden')) {
+                        window.switchView('categoryView');
+                    }
+                }
+            }, (error) => {
+                document.getElementById('firestoreErrorModal').style.display = 'flex';
+            });
+        };
+
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                currentUser = user;
+                await setupSession(user.uid);
+
+                if (categoriesRefTrack && categoriesCallbackTrack) {
+                    off(categoriesRefTrack, 'value', categoriesCallbackTrack);
+                }
+                connectDatabaseListener(user.uid);
+            }
+        });
+
+        window.loginAsGuest = () => {
+            signInAnonymously(auth).catch(err => {
+                document.getElementById('guestErrorModal').style.display = 'flex';
+            });
+        };
+
+        // 本地單機體驗模式 (支援隔離資料流)
+        window.activateLocalMode = () => {
+            document.querySelectorAll('.modal-overlay').forEach(m => m.style.display = 'none');
+            currentUser = { uid: "local_user" };
+            currentSessionId = "local_1";
+            allCategories = [
+                { id: "cat1", name: "情緒", icon: "😊", color: "#dcfce7", cards: { "card_1": {text:"開心", icon:"😊"}, "card_2": {text:"生氣", icon:"😡"}, "card_3": {text:"難過", icon:"😢"} } },
+                { id: "cat2", name: "家人", icon: "👨‍👩‍👧", color: "#dbeafe", cards: { "card_1": {text:"爸爸", icon:"👨"}, "card_2": {text:"媽媽", icon:"👩"}, "card_3": {text:"奶奶", icon:"👵"} } },
+                { id: "cat3", name: "動作", icon: "🏃", color: "#ffedd5", cards: { "card_1": {text:"吃", icon:"😋"}, "card_2": {text:"喝", icon:"🥛"}, "card_3": {text:"跑", icon:"🏃"} } },
+                { id: "cat4", name: "食物", icon: "🍱", color: "#fef9c3", cards: { "card_1": {text:"飯", icon:"🍚"}, "card_2": {text:"麵", icon:"🍜"}, "card_3": {text:"餅乾", icon:"🍪"} } }
+            ];
+            window.showToast("📴 已啟用本地單機體驗模式！");
+            window.switchView('categoryView');
+        };
+
+        // 本地單機體驗模式下的記憶體更新重繪
+        window.updateLocalData = (newCategories) => {
+            allCategories = newCategories;
+            if (!document.getElementById('categoryView').classList.contains('hidden')) {
+                renderCategories();
+            }
+            if (!document.getElementById('boardView').classList.contains('hidden')) {
+                renderMainBoard();
+            }
+            if (!document.getElementById('reportView').classList.contains('hidden')) {
+                renderReportBoard();
+            }
+        };
+
+        window.logout = () => {
+            signOut(auth);
+            window.location.reload();
+        };
+    </script>
+    <style>
+        @keyframes pop { 0% { transform: scale(0.85); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+        .animate-pop { animation: pop 0.2s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
+        body { background-color: #fefce8; font-family: 'Microsoft JhengHei', sans-serif; overflow: hidden; height: 100vh; user-select: none; }
+        .view-screen { position: absolute; inset: 0; padding: 2vh; display: flex; flex-direction: column; align-items: center; height: 100vh; width: 100vw; box-sizing: border-box; }
+        
+        .category-wrapper { width: 100%; flex-grow: 1; position: relative; display: flex; align-items: center; }
+        .category-scroll-container { width: 100%; height: 100%; display: flex; flex-direction: row; align-items: center; justify-content: flex-start; overflow-x: auto; scroll-snap-type: x mandatory; padding: 0 40px; scroll-behavior: smooth; flex-wrap: nowrap; -webkit-overflow-scrolling: touch; }
+        .cat-card, .cat-card-add { flex-shrink: 0; scroll-snap-align: center; margin: 0 15px; }
+
+        .nav-arrow { position: absolute; top: 50%; transform: translateY(-50%); width: 70px; height: 70px; background: rgba(0,0,0,0.15); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 40px; cursor: pointer; z-index: 10; transition: 0.3s; color: white; border: none; }
+        .nav-arrow:hover { background: rgba(0,0,0,0.4); transform: translateY(-50%) scale(1.1); }
+        .nav-arrow.left { left: 10px; }
+        .nav-arrow.right { right: 10px; }
+
+        .cat-card { width: 240px; height: 45vh; max-height: 380px; border: 6px solid #fff; border-radius: 30px; display: flex; flex-direction: column; align-items: center; justify-content: space-evenly; padding: 15px; cursor: pointer; transition: 0.2s; box-shadow: 0 8px 0 rgba(0,0,0,0.05); background: white; touch-action: none; }
+        .cat-card-add { width: 240px; height: 45vh; max-height: 380px; border: 6px dashed #000; border-radius: 30px; display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; background: rgba(255,255,255,0.4); }
+
+        .board-card-main { border: 3px solid #000; border-radius: 15px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 5px; cursor: pointer; box-shadow: 3px 3px 0 #000; transition: 0.1s; background: #fff; height: 100%; width: 100%; box-sizing: border-box; overflow: hidden; touch-action: none; }
+        .board-card-main:active { transform: translate(1px, 1px); box-shadow: none; }
+        .board-empty { border: 2px dashed #ccc; border-radius: 15px; opacity: 0.15; height: 100%; width: 100%; }
+        
+        .sentence-bar { background-color: #e5e7eb; border: 6px solid #9ca3af; border-radius: 30px; height: 14vh; min-height: 100px; display: flex; align-items: center; padding: 0 15px; gap: 10px; flex-grow: 1; overflow-x: auto; box-shadow: inset 4px 4px 10px rgba(0,0,0,0.1); }
+        .grid-10x4 { display: grid; grid-template-columns: repeat(10, 1fr); grid-template-rows: repeat(4, 1fr); gap: 1vh; width: 100%; flex-grow: 1; margin-top: 1vh; max-width: 1400px; }
+
+        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; backdrop-filter: blur(5px); }
+        .modal-content { background: white; padding: 25px; border-radius: 30px; width: 90%; max-width: 480px; border: 8px solid #facc15; }
+        
+        .home-btn { position: fixed; bottom: 3vh; right: 3vh; width: 85px; height: 85px; border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; z-index: 50; transition: 0.2s; border: 4px solid #fff; box-shadow: 0 6px 15px rgba(239, 68, 68, 0.4); }
+        .home-btn:active { transform: scale(0.9); }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+        .speak-btn { cursor: pointer; transition: transform 0.2s; }
+        .speak-btn:active { transform: scale(0.9); }
+    </style>
+</head>
+<body class="flex flex-col items-center justify-center">
+
+    <div id="toastNotification" class="hidden fixed top-8 left-1/2 -translate-x-1/2 bg-gradient-to-r from-blue-600 to-indigo-600 border-4 border-black text-white px-8 py-4 rounded-[2rem] text-xl font-black shadow-2xl z-[200] items-center gap-3">
+        <span>📢</span>
+        <span id="toastText">提示內容</span>
+    </div>
+
+    <!-- 登入頁 -->
+    <div id="loginView" class="view-screen flex justify-center bg-gradient-to-b from-[#fefce8] to-[#fffbeb]">
+        <h1 class="text-5xl lg:text-7xl font-black mb-6 text-blue-600 drop-shadow-xl text-center">AAC 溝通板系統</h1>
+        <div class="bg-white border-8 border-black p-8 rounded-[2.5rem] shadow-[8px_8px_0_#000] w-full max-w-md flex flex-col gap-4 animate-pop">
+            <h2 class="text-2xl font-black text-center text-gray-700">🔐 帳號登入 / 註冊</h2>
+            <div class="flex flex-col gap-3">
+                <input id="loginEmail" type="email" placeholder="輸入電子郵件 信箱" class="w-full p-3 border-4 border-black rounded-2xl text-lg outline-none focus:bg-yellow-50">
+                <input id="loginPass" type="password" placeholder="輸入密碼 (登入或自動註冊)" class="w-full p-3 border-4 border-black rounded-2xl text-lg outline-none focus:bg-yellow-50">
+            </div>
+            <button onclick="loginWithPassword()" class="bg-blue-500 text-white border-4 border-black p-3 rounded-2xl font-black text-xl shadow-[4px_4px_0_#000] hover:bg-blue-600 active:translate-y-1 active:shadow-none transition-all">登入 / 註冊新帳號</button>
+            <div class="relative flex py-2 items-center">
+                <div class="flex-grow border-t-2 border-gray-400"></div>
+                <span class="flex-shrink mx-4 text-gray-400 text-sm font-bold">或使用以下快速模式</span>
+                <div class="flex-grow border-t-2 border-gray-400"></div>
+            </div>
+            <button onclick="loginTestAccount()" class="bg-emerald-400 text-black border-4 border-black p-3 rounded-2xl font-black text-xl shadow-[4px_4px_0_#000] hover:bg-emerald-500 active:translate-y-1 active:shadow-none transition-all">👉 登入測試帳號</button>
+            <button onclick="loginAsGuest()" class="bg-gray-200 text-gray-700 border-4 border-black p-3 rounded-2xl font-bold text-lg hover:bg-gray-300 transition-all">訪客匿名登入</button>
+        </div>
+    </div>
+
+    <!-- 類別挑選頁 -->
+    <div id="categoryView" class="view-screen hidden">
+        <div class="w-full flex justify-between items-center max-w-6xl mb-4 px-4">
+            <h2 class="text-4xl lg:text-5xl font-black tracking-widest text-gray-800">挑 選 類 別</h2>
+            <button onclick="logout()" class="bg-red-500 text-white border-4 border-black font-black py-2 px-6 rounded-2xl hover:bg-red-600 shadow-[4px_4px_0_#000] active:translate-y-1 active:shadow-none">登出帳號 ➔</button>
+        </div>
+        <div class="category-wrapper">
+            <button class="nav-arrow left lg:flex hidden" onclick="scrollCategories('left')">❮</button>
+            <div id="categoryGrid" class="category-scroll-container no-scrollbar"></div>
+            <button class="nav-arrow right lg:flex hidden" onclick="scrollCategories('right')">❯</button>
+        </div>
+        <div class="w-full max-w-5xl mt-4 pb-16">
+            <p class="text-xl font-black mb-1 ml-4 text-gray-700">已選類別（最多3種）：</p>
+            <div class="w-full h-24 bg-gray-200 rounded-[3rem] border-[6px] border-gray-400 flex items-center p-4 gap-4 relative shadow-inner">
+                <div id="selectedBar" class="flex gap-4 overflow-x-auto no-scrollbar"></div>
+                <button onclick="switchView('boardView')" class="absolute -right-6 bg-yellow-400 w-24 h-24 rounded-full flex items-center justify-center text-5xl shadow-2xl border-[6px] border-white transition-transform hover:scale-110 active:scale-90">➡️</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 編輯頁 -->
+    <div id="editCategoryView" class="view-screen hidden">
+        <div class="flex flex-col items-center mb-4">
+            <div id="editHeaderIcon" class="mb-1"></div>
+            <h2 id="editHeaderLabel" class="text-4xl font-black text-gray-800">類別</h2>
+        </div>
+        <div class="bg-white/40 p-6 rounded-[3rem] border-8 border-white w-full max-w-[95vw] shadow-2xl flex-grow overflow-y-auto">
+            <div id="editCardsGrid" class="flex flex-wrap justify-center gap-6 pb-8"></div>
+        </div>
+        <div class="home-btn bg-red-500 text-white border-4 border-black" onclick="switchView('categoryView')">
+            <span class="text-3xl">🏠</span>
+            <span class="text-xs font-bold">主頁</span>
+        </div>
+    </div>
+
+    <!-- 主溝通板頁 -->
+    <div id="boardView" class="view-screen hidden overflow-hidden">
+        <div class="flex w-full gap-4 mb-3 max-w-[1400px] items-start relative h-[25vh] flex-shrink-0">
+            <button onclick="window.analyzeAI()" class="w-24 h-24 bg-blue-100 rounded-full border-4 border-blue-400 text-5xl shadow-xl flex items-center justify-center hover:bg-blue-200 transition-colors flex-shrink-0 animate-bounce">🤖</button>
+            <div class="flex-grow flex flex-col h-full overflow-hidden">
+                <div class="relative flex items-center h-full">
+                    <div id="sentenceBox" class="sentence-bar no-scrollbar pr-36"></div>
+                    <div class="absolute right-4 flex flex-col items-center gap-1">
+                        <button onclick="window.removeLastCard()" class="w-10 h-10 bg-red-500 text-white rounded-full text-2xl font-black flex items-center justify-center shadow-lg border-4 border-white">✕</button>
+                        <div class="flex gap-1 items-center">
+                            <button onclick="window.speakSentence()" class="speak-btn w-12 h-12 flex items-center justify-center text-4xl">🗣️</button>
+                            <button onclick="window.clearSentence()" class="w-8 h-8 flex items-center justify-center text-2xl grayscale">🗑️</button>
+                        </div>
+                    </div>
+                </div>
+                <!-- 結構化換行排版 AI 建議區塊 -->
+                <div class="ai-area hidden mt-2 p-4 bg-white border-4 border-blue-400 rounded-2xl shadow-xl overflow-y-auto max-h-[140px] flex justify-between items-center animate-pop">
+                    <div class="ai-result text-xs lg:text-sm leading-relaxed tracking-wide flex-grow">
+                        <!-- 動態插入結構化 HTML -->
+                    </div>
+                    <button onclick="window.speakAISuggestion()" class="bg-blue-500 text-white font-black py-1.5 px-5 rounded-full text-xs shadow-md hover:bg-blue-600 transition-all flex-shrink-0 ml-4">🔊 播放</button>
+                </div>
+            </div>
+        </div>
+        <div id="boardGrid" class="grid-10x4"></div>
+        <div class="home-btn bg-red-500 text-white border-4 border-black" onclick="switchView('categoryView')">
+            <span class="text-3xl">🏠</span>
+            <span class="text-xs font-bold">主頁</span>
+        </div>
+    </div>
+
+    <!-- 告狀專用頁面 -->
+    <div id="reportView" class="view-screen hidden overflow-hidden">
+        <div class="flex w-full gap-4 mb-3 max-w-[1400px] items-start relative h-[25vh] flex-shrink-0">
+            <button onclick="window.analyzeAI()" class="w-24 h-24 bg-blue-100 rounded-full border-4 border-blue-400 text-5xl shadow-xl flex items-center justify-center hover:bg-blue-200 transition-colors flex-shrink-0">🤖</button>
+            <div class="flex-grow flex flex-col h-full overflow-hidden">
+                <div class="relative flex items-center h-full">
+                    <div id="sentenceBox" class="sentence-bar no-scrollbar pr-36"></div>
+                    <div class="absolute right-4 flex flex-col items-center gap-1">
+                        <button onclick="window.removeLastCard()" class="w-10 h-10 bg-red-500 text-white rounded-full text-2xl font-black flex items-center justify-center shadow-lg border-4 border-white">✕</button>
+                        <div class="flex gap-1 items-center">
+                            <button onclick="window.speakSentence()" class="speak-btn w-12 h-12 flex items-center justify-center text-4xl">🗣️</button>
+                            <button onclick="window.clearSentence()" class="w-8 h-8 flex items-center justify-center text-2xl grayscale">🗑️</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="ai-area hidden mt-2 p-4 bg-white border-4 border-blue-400 rounded-2xl shadow-xl overflow-y-auto max-h-[140px] flex justify-between items-center animate-pop">
+                    <div class="ai-result text-xs lg:text-sm leading-relaxed tracking-wide flex-grow"></div>
+                    <button onclick="window.speakAISuggestion()" class="bg-blue-500 text-white font-black py-1.5 px-5 rounded-full text-xs shadow-md hover:bg-blue-600 transition-all flex-shrink-0 ml-4">🔊 播放</button>
+                </div>
+            </div>
+        </div>
+        <div id="reportBoardGrid" class="grid-10x4"></div>
+        <div class="home-btn bg-red-500 text-white border-4 border-black" onclick="switchView('categoryView')">
+            <span class="text-3xl">🏠</span>
+            <span class="text-xs font-bold">主頁</span>
+        </div>
+    </div>
+
+    <!-- 新增類別彈窗 -->
+    <div id="addCategoryModal" class="modal-overlay">
+        <div class="modal-content">
+            <h2 class="text-2xl lg:text-3xl font-black mb-4 text-center text-yellow-600">🆕 新增類別</h2>
+            <div class="space-y-3">
+                <input id="catName" placeholder="名稱" class="w-full p-3 bg-gray-100 rounded-xl text-lg outline-none focus:ring-4 ring-yellow-400">
+                <input type="color" id="catColor" value="#ffffff" class="w-full h-12 rounded-xl cursor-pointer border-2 border-gray-300">
+                <div class="flex gap-2">
+                    <input id="catEmoji" placeholder="Emoji 🍎" class="w-1/2 p-3 bg-gray-100 rounded-xl text-lg">
+                    <input type="file" id="catFile" class="w-1/2 mt-2 text-sm">
+                </div>
+                <div class="flex gap-2 pt-4">
+                    <button onclick="closeModal('addCategoryModal')" class="flex-1 py-3 bg-gray-200 rounded-xl font-bold">取消</button>
+                    <button onclick="saveCategory()" class="flex-1 py-3 bg-yellow-400 text-white rounded-xl font-black shadow-md">確定</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 新增字卡彈窗 -->
+    <div id="addCardModal" class="modal-overlay">
+        <div class="modal-content">
+            <h2 class="text-2xl lg:text-3xl font-black mb-4 text-center text-blue-600">✨ 新增字卡</h2>
+            <div class="space-y-3">
+                <input id="cardName" placeholder="文字" class="w-full p-3 bg-gray-100 rounded-xl text-lg outline-none focus:ring-4 ring-blue-400">
+                <div class="flex flex-col gap-1">
+                    <label class="font-bold text-gray-500 text-xs">選擇放入的目標類別：</label>
+                    <select id="targetCategory" class="w-full p-2.5 bg-gray-100 rounded-xl text-lg outline-none border-2 border-gray-200"></select>
+                </div>
+                <div class="flex gap-2">
+                    <input id="cardEmoji" placeholder="Emoji 🍪" class="w-1/2 p-3 bg-gray-100 rounded-xl text-lg">
+                    <input type="file" id="cardFile" class="w-1/2 mt-2 text-sm">
+                </div>
+                <div class="flex gap-2 pt-4">
+                    <button onclick="closeModal('addCardModal')" class="flex-1 py-3 bg-gray-200 rounded-xl font-bold">取消</button>
+                    <button onclick="saveCard()" class="flex-1 py-3 bg-blue-500 text-white rounded-xl font-black shadow-md">確定新增</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 刪除確認彈窗 -->
+    <div id="deleteConfirmModal" class="modal-overlay">
+        <div class="modal-content text-center border-red-500">
+            <h2 class="text-xl lg:text-2xl font-black mb-3 text-red-600">⚠ 確認刪除？</h2>
+            <p class="text-base lg:text-lg mb-4">確定要刪除「<span id="deleteTargetName" class="font-black"></span>」嗎？此動作無法復原。</p>
+            <div class="flex gap-3">
+                <button onclick="closeModal('deleteConfirmModal')" class="flex-1 py-3 bg-gray-200 rounded-xl font-bold">取消</button>
+                <button onclick="confirmDelete()" class="flex-1 py-3 bg-red-500 text-white rounded-xl font-black">刪除</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 各類錯誤提示與單機模式引導彈窗 -->
+    <div id="guestErrorModal" class="modal-overlay">
+        <div class="modal-content text-center border-orange-500">
+            <h2 class="text-xl font-black text-orange-600 mb-2">💡 訪客登入設定導引</h2>
+            <p class="text-sm text-gray-600 mb-4 leading-relaxed">您的 Firebase 目前尚未啟用「匿名登入」。請在後台啟用此功能，或者一鍵切換至本地單機模式體驗！</p>
+            <button onclick="activateLocalMode()" class="w-full bg-blue-500 text-white p-3 rounded-xl font-bold hover:bg-blue-600">切換為本地單機體驗模式</button>
+        </div>
+    </div>
+
+    <div id="firestoreErrorModal" class="modal-overlay">
+        <div class="modal-content text-center border-red-500">
+            <h2 class="text-xl font-black text-red-600 mb-2">🔒 資料庫規則未開放</h2>
+            <p class="text-sm text-gray-600 mb-4 leading-relaxed">系統嘗試載入時發生了權限錯誤。這表示您的 Firebase Realtime Database 規則尚未設為公開讀寫。</p>
+            <button onclick="activateLocalMode()" class="w-full bg-blue-500 text-white p-3 rounded-xl font-bold hover:bg-blue-600">➔ 一鍵切換至單機快取模式</button>
+        </div>
+    </div>
+
+    <div id="authErrorModal" class="modal-overlay">
+        <div class="modal-content text-center border-orange-500">
+            <h2 class="text-xl font-black text-orange-600 mb-2">💡 啟用帳密登入方法導引</h2>
+            <p class="text-sm text-gray-600 mb-4 leading-relaxed">您的 Firebase 目前尚未啟用「電子郵件/密碼」登入方式。請至 Firebase Console 的 Authentication 啟用它！</p>
+            <button onclick="activateLocalMode()" class="w-full bg-blue-500 text-white p-3 rounded-xl font-bold hover:bg-blue-600">➔ 切換為本地單機體驗模式</button>
+        </div>
+    </div>
+
+</body>
+</html>
